@@ -1,141 +1,35 @@
-from queue import Queue
-from threading import Thread
-from ipykernel.kernelbase import Kernel
-import re
-import subprocess
-import tempfile
 import os
-import os.path as path
+import tempfile
+import subprocess
+from IPython.core.magic import register_cell_magic
 
-class RealTimeSubprocess(subprocess.Popen):
-    def __init__(self, cmd, write_to_stdout, write_to_stderr):
-        self._write_to_stdout = write_to_stdout
-        self._write_to_stderr = write_to_stderr
+@register_cell_magic
+def c(line, cell):
+    # Criar um arquivo temporário para o código-fonte C
+    with tempfile.NamedTemporaryFile(suffix=".c", delete=False) as source_file:
+        source_file.write(cell.encode('utf-8'))
+        source_file.flush()
+        source_path = source_file.name
 
-        super().__init__(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    # Criar um arquivo temporário para o executável
+    binary_path = source_path[:-2]  # Remover ".c" para criar o executável
 
-        self._stdout_queue = Queue()
-        self._stdout_thread = Thread(target=RealTimeSubprocess._enqueue_output, args=(self.stdout, self._stdout_queue))
-        self._stdout_thread.daemon = True
-        self._stdout_thread.start()
+    # Compilar o código C
+    compile_cmd = f"gcc {source_path} -o {binary_path} -std=c11 -fPIC -shared -rdynamic 2>&1"
+    compile_process = subprocess.run(compile_cmd, shell=True, capture_output=True, text=True)
 
-        self._stderr_queue = Queue()
-        self._stderr_thread = Thread(target=RealTimeSubprocess._enqueue_output, args=(self.stderr, self._stderr_queue))
-        self._stderr_thread.daemon = True
-        self._stderr_thread.start()
+    if compile_process.returncode != 0:
+        print("[Erro na compilação]\n", compile_process.stderr)
+        os.remove(source_path)
+        return
 
-    @staticmethod
-    def _enqueue_output(stream, queue):
-        for line in iter(lambda: stream.read(4096), b''):
-            queue.put(line)
-        stream.close()
+    # Executar o código compilado
+    run_cmd = f"{binary_path}"
+    run_process = subprocess.run(run_cmd, shell=True, capture_output=True, text=True)
 
-    def write_contents(self):
-        def read_all_from_queue(queue):
-            res = b''
-            size = queue.qsize()
-            while size != 0:
-                res += queue.get_nowait()
-                size -= 1
-            return res
+    # Exibir saída da execução
+    print(run_process.stdout)
 
-        stdout_contents = read_all_from_queue(self._stdout_queue)
-        if stdout_contents:
-            self._write_to_stdout(stdout_contents)
-        stderr_contents = read_all_from_queue(self._stderr_queue)
-        if stderr_contents:
-            self._write_to_stderr(stderr_contents)
-
-class CKernel(Kernel):
-    implementation = 'jupyter_c_kernel'
-    implementation_version = '1.0'
-    language = 'c'
-    language_version = 'C11'
-    language_info = {'name': 'c',
-                     'mimetype': 'text/plain',
-                     'file_extension': '.c'}
-    banner = "C kernel using GCC (C11)."
-
-    def __init__(self, *args, **kwargs):
-        super(CKernel, self).__init__(*args, **kwargs)
-        self.files = []
-        mastertemp = tempfile.mkstemp(suffix='.out')
-        os.close(mastertemp[0])
-        self.master_path = mastertemp[1]
-        filepath = path.join(path.dirname(path.realpath(__file__)), 'resources', 'master.c')
-        subprocess.call(['gcc', filepath, '-std=c11', '-rdynamic', '-ldl', '-o', self.master_path])
-
-    def cleanup_files(self):
-        for file in self.files:
-            os.remove(file)
-        os.remove(self.master_path)
-
-    def new_temp_file(self, **kwargs):
-        kwargs['delete'] = False
-        kwargs['mode'] = 'w'
-        file = tempfile.NamedTemporaryFile(**kwargs)
-        self.files.append(file.name)
-        return file
-
-    def _write_to_stdout(self, contents):
-        self.send_response(self.iopub_socket, 'stream', {'name': 'stdout', 'text': contents})
-
-    def _write_to_stderr(self, contents):
-        self.send_response(self.iopub_socket, 'stream', {'name': 'stderr', 'text': contents})
-
-    def create_jupyter_subprocess(self, cmd):
-        return RealTimeSubprocess(cmd,
-                                  lambda contents: self._write_to_stdout(contents.decode()),
-                                  lambda contents: self._write_to_stderr(contents.decode()))
-
-    def compile_with_gcc(self, source_filename, binary_filename, cflags=None, ldflags=None):
-        cflags = ['-std=c11', '-fPIC', '-shared', '-rdynamic'] + (cflags or [])
-        args = ['gcc', source_filename] + cflags + ['-o', binary_filename] + (ldflags or [])
-        return self.create_jupyter_subprocess(args)
-
-    def _filter_magics(self, code):
-        magics = {'cflags': [], 'ldflags': [], 'args': []}
-        lines = code.splitlines()
-        
-        if lines and lines[0].startswith("%%c"):
-            lines.pop(0)
-        
-        for line in lines:
-            if line.startswith('//%'):
-                key, value = line[3:].split(":", 1)
-                key = key.strip().lower()
-
-                if key in ['ldflags', 'cflags']:
-                    magics[key] += value.split()
-                elif key == "args":
-                    magics['args'] += re.findall(r'(?:[^\s,"]|"(?:\\.|[^"])*")+', value)
-
-        return magics, '\n'.join(lines)
-
-    def do_execute(self, code, silent, store_history=True,
-                   user_expressions=None, allow_stdin=False):
-        magics, clean_code = self._filter_magics(code)
-
-        with self.new_temp_file(suffix='.c') as source_file:
-            source_file.write(clean_code)
-            source_file.flush()
-            with self.new_temp_file(suffix='.out') as binary_file:
-                p = self.compile_with_gcc(source_file.name, binary_file.name, magics['cflags'], magics['ldflags'])
-                while p.poll() is None:
-                    p.write_contents()
-                p.write_contents()
-                if p.returncode != 0:
-                    self._write_to_stderr(f"[C kernel] GCC exited with code {p.returncode}, execution aborted.")
-                    return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
-
-        p = self.create_jupyter_subprocess([self.master_path, binary_file.name] + magics['args'])
-        while p.poll() is None:
-            p.write_contents()
-        p.write_contents()
-
-        if p.returncode != 0:
-            self._write_to_stderr(f"[C kernel] Executable exited with code {p.returncode}")
-        return {'status': 'ok', 'execution_count': self.execution_count, 'payload': [], 'user_expressions': {}}
-
-    def do_shutdown(self, restart):
-        self.cleanup_files()
+    # Remover arquivos temporários
+    os.remove(source_path)
+    os.remove(binary_path)
